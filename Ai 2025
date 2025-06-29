@@ -1,0 +1,532 @@
+import gradio as gr
+import requests
+import tempfile
+import os
+from gtts import gTTS
+import speech_recognition as sr
+from typing import Tuple, Optional
+import logging
+import datetime
+import time
+import io
+import base64
+
+# === CONFIG ===
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY",
+                               "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")
+MODEL_NAME = "deepseek/deepseek-r1-0528-qwen3-8b:free"
+
+# === LOGGING SETUP ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# === AUDIO OUTPUT SETUP ===
+def text_to_speech(text: str) -> Optional[str]:
+    """Convert text to speech using gTTS and save as temporary file."""
+    try:
+        clean_text = text.replace("*", "").replace("#", "").strip()
+
+        if not clean_text:
+            return None
+
+        # Create TTS object
+        tts = gTTS(text=clean_text, lang='en', slow=False)
+
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
+            tmpname = tmpfile.name
+
+        tts.save(tmpname)
+
+        if os.path.exists(tmpname) and os.path.getsize(tmpname) > 0:
+            return tmpname
+        else:
+            logger.error("TTS file was not created properly")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error in text-to-speech: {e}")
+        return None
+
+
+def get_current_time_info():
+    """Get current time and date information locally."""
+    now = datetime.datetime.now()
+
+    time_info = {
+        'current_time': now.strftime("%I:%M %p"),
+        'current_date': now.strftime("%A, %B %d, %Y"),
+        'current_datetime': now.strftime("%A, %B %d, %Y at %I:%M %p"),
+        'day_of_week': now.strftime("%A"),
+        'month': now.strftime("%B"),
+        'year': str(now.year),
+        'hour_24': now.hour,
+        'hour_12': now.strftime("%I"),
+        'minute': now.minute,
+        'am_pm': now.strftime("%p"),
+        'timezone': time.tzname[0] if not time.daylight else time.tzname[1]
+    }
+
+    return time_info
+
+
+def handle_time_queries(message: str) -> Optional[str]:
+    """Handle time-related queries locally without API calls."""
+    message_lower = message.lower()
+    time_info = get_current_time_info()
+
+    # Time queries
+    if any(phrase in message_lower for phrase in ['what time', 'current time', 'time is it']):
+        return f"The current time is {time_info['current_time']}"
+
+    # Date queries
+    if any(phrase in message_lower for phrase in ['what date', 'today\'s date', 'what day']):
+        return f"Today is {time_info['current_date']}"
+
+    # Combined date and time
+    if any(phrase in message_lower for phrase in ['date and time', 'current date and time']):
+        return f"It is currently {time_info['current_datetime']}"
+
+    # Day of week
+    if 'day of the week' in message_lower or 'what day is it' in message_lower:
+        return f"Today is {time_info['day_of_week']}"
+
+    return None
+
+
+# === SPEECH RECOGNITION ===
+def speech_to_text_from_file(audio_data) -> str:
+    """Convert audio file to text using SpeechRecognition."""
+    if audio_data is None:
+        return "Please record or upload an audio file first."
+
+    try:
+        recognizer = sr.Recognizer()
+
+        # Handle different audio input types
+        if hasattr(audio_data, 'name'):
+            # It's a file path
+            audio_file = audio_data.name
+        elif isinstance(audio_data, str):
+            # It's already a file path
+            audio_file = audio_data
+        else:
+            # It's the audio data itself
+            audio_file = audio_data
+
+        with sr.AudioFile(audio_file) as source:
+            audio = recognizer.record(source)
+
+        try:
+            # Try Google Speech Recognition first
+            text = recognizer.recognize_google(audio)
+            logger.info(f"Recognized: {text}")
+            return text
+        except sr.UnknownValueError:
+            try:
+                # Fallback to offline recognition
+                text = recognizer.recognize_sphinx(audio)
+                logger.info(f"Recognized (Sphinx): {text}")
+                return text
+            except:
+                return "Sorry, I couldn't understand the audio clearly. Please try again with clearer speech."
+
+    except Exception as e:
+        logger.error(f"Error in speech recognition: {e}")
+        return f"Error processing audio: {str(e)}"
+
+
+def simulate_listening_state():
+    """Simulate the listening state for UI feedback."""
+    return "Listening... Please record your voice using the microphone button below."
+
+
+# === OPENROUTER AI CALL ===
+def ask_ai(message: str) -> Tuple[str, Optional[str]]:
+    """Send message to AI and return response with audio."""
+    if not message.strip():
+        return "Please provide a question or input.", None
+
+    # Check for time-related queries first (handle locally)
+    time_response = handle_time_queries(message)
+    if time_response:
+        audio_path = text_to_speech(time_response)
+        return time_response, audio_path
+
+    # Handle other common queries locally
+    message_lower = message.lower()
+
+    # Weather queries (since we can't provide real weather)
+    if any(phrase in message_lower for phrase in ['weather', 'temperature', 'forecast']):
+        response = "I can't access real-time weather data, but you can check your local weather app or website for current conditions."
+        audio_path = text_to_speech(response)
+        return response, audio_path
+
+    # If API key is not configured, handle gracefully
+    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your-api-key-here":
+        response = "Please configure your OpenRouter API key to use AI features. For now, I can help with time and basic queries."
+        audio_path = text_to_speech(response)
+        return response, audio_path
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://your-app.com",
+        "X-Title": "Voice Assistant"
+    }
+
+    # Get current time info to provide context to AI
+    time_info = get_current_time_info()
+    system_context = f"""You are a helpful voice assistant. The current date and time is {time_info['current_datetime']} ({time_info['timezone']}). 
+    Provide clear, concise responses suitable for speech output. Avoid using special characters or formatting that don't translate well to speech.
+    If asked about time or date, use the provided context information."""
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_context
+            },
+            {
+                "role": "user",
+                "content": message
+            }
+        ],
+        "temperature": 0.7,
+        "max_tokens": 500,
+        "top_p": 0.9
+    }
+
+    try:
+        logger.info(f"Sending request to AI: {message[:50]}...")
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        res.raise_for_status()
+
+        response_data = res.json()
+        reply = response_data["choices"][0]["message"]["content"]
+
+        logger.info(f"AI response received: {reply[:50]}...")
+
+        audio_path = text_to_speech(reply)
+
+        return reply, audio_path
+
+    except requests.exceptions.Timeout:
+        return "Request timed out. Please try again.", None
+    except requests.exceptions.ConnectionError:
+        return "Connection error. Please check your internet connection.", None
+    except requests.exceptions.HTTPError as e:
+        if res.status_code == 401:
+            return "Invalid API key. Please check your OpenRouter API key.", None
+        elif res.status_code == 429:
+            return "Rate limit exceeded. Please wait and try again.", None
+        else:
+            return f"API Error (HTTP {res.status_code}): {e}", None
+    except KeyError:
+        return "Unexpected response format from API.", None
+    except Exception as e:
+        logger.error(f"Unexpected error in AI request: {e}")
+        return f"An unexpected error occurred: {e}", None
+
+
+# === GRADIO INTERFACE ===
+def create_interface():
+    """Create and configure the Gradio interface."""
+
+    # Custom CSS for the dark theme matching the image
+    custom_css = """
+    /* Dark theme styling */
+    .gradio-container {
+        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%) !important;
+        color: white !important;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif !important;
+    }
+
+    .dark {
+        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%) !important;
+    }
+
+    /* Main container */
+    .main-container {
+        max-width: 400px !important;
+        margin: 0 auto !important;
+        padding: 40px 20px !important;
+        text-align: center !important;
+        min-height: 100vh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: center !important;
+        align-items: center !important;
+    }
+
+    /* Large circular recording button */
+    .record-button {
+        width: 200px !important;
+        height: 200px !important;
+        border-radius: 50% !important;
+        background: linear-gradient(135deg, #ffffff 0%, #f0f0f0 100%) !important;
+        border: none !important;
+        box-shadow: 0 20px 40px rgba(0,0,0,0.3) !important;
+        transition: all 0.3s ease !important;
+        cursor: pointer !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: 40px auto !important;
+        font-size: 48px !important;
+    }
+
+    .record-button:hover {
+        transform: scale(1.05) !important;
+        box-shadow: 0 25px 50px rgba(0,0,0,0.4) !important;
+    }
+
+    .record-button:active {
+        transform: scale(0.95) !important;
+    }
+
+    /* Status text */
+    .status-text {
+        color: #ffffff !important;
+        font-size: 16px !important;
+        margin: 20px 0 !important;
+        font-weight: 300 !important;
+    }
+
+    /* Control buttons */
+    .control-buttons {
+        display: flex !important;
+        gap: 20px !important;
+        margin-top: 30px !important;
+        justify-content: center !important;
+    }
+
+    .control-btn {
+        width: 50px !important;
+        height: 50px !important;
+        border-radius: 50% !important;
+        background: rgba(255,255,255,0.1) !important;
+        border: 2px solid rgba(255,255,255,0.3) !important;
+        color: white !important;
+        font-size: 20px !important;
+        cursor: pointer !important;
+        transition: all 0.3s ease !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+
+    .control-btn:hover {
+        background: rgba(255,255,255,0.2) !important;
+        border-color: rgba(255,255,255,0.5) !important;
+        transform: scale(1.1) !important;
+    }
+
+    /* Response area */
+    .response-area {
+        background: rgba(255,255,255,0.05) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 15px !important;
+        padding: 20px !important;
+        margin: 20px 0 !important;
+        color: white !important;
+        backdrop-filter: blur(10px) !important;
+        max-height: 150px !important;
+        overflow-y: auto !important;
+    }
+
+    /* Hide default gradio elements */
+    .gradio-container .wrap {
+        background: transparent !important;
+        border: none !important;
+    }
+
+    .gradio-container .form {
+        background: transparent !important;
+        border: none !important;
+    }
+
+    /* Audio player styling */
+    audio {
+        background: rgba(255,255,255,0.1) !important;
+        border-radius: 10px !important;
+        margin: 10px 0 !important;
+    }
+
+    /* Recording animation */
+    @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.1); }
+        100% { transform: scale(1); }
+    }
+
+    .recording {
+        animation: pulse 1.5s infinite !important;
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%) !important;
+        color: white !important;
+    }
+
+    /* Listening animation */
+    @keyframes listening {
+        0% { box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
+        50% { box-shadow: 0 20px 40px rgba(0,0,0,0.3), 0 0 0 10px rgba(255,255,255,0.1); }
+        100% { box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
+    }
+
+    .listening {
+        animation: listening 2s infinite !important;
+    }
+
+    /* Hide audio input */
+    .hidden-audio {
+        display: none !important;
+    }
+    """
+
+    with gr.Blocks(
+            title="🎧 Voice Assistant AI",
+            theme=gr.themes.Base(),
+            css=custom_css
+    ) as demo:
+
+        # State management
+        is_recording = gr.State(False)
+
+        with gr.Column(elem_classes="main-container"):
+
+            # Hidden audio input for recording
+            audio_input = gr.Audio(
+                sources=["microphone"],
+                type="filepath",
+                elem_classes="hidden-audio"
+            )
+
+            # Main recording button
+            record_button = gr.Button(
+                "🎤",
+                elem_classes="record-button",
+                variant="primary"
+            )
+
+            # Status text
+            status_text = gr.HTML(
+                '<div class="status-text">Standard voice</div>',
+                elem_classes="status-text"
+            )
+
+            # Control buttons row
+            with gr.Row(elem_classes="control-buttons"):
+                mic_btn = gr.Button("🎤", elem_classes="control-btn", size="sm")
+                stop_btn = gr.Button("✕", elem_classes="control-btn", size="sm")
+
+            # Response area (hidden by default)
+            with gr.Column(visible=False) as response_section:
+                recognized_text = gr.Textbox(
+                    label="Recognized Speech",
+                    elem_classes="response-area",
+                    interactive=False
+                )
+
+                ai_response = gr.Textbox(
+                    label="AI Response",
+                    elem_classes="response-area",
+                    lines=4,
+                    interactive=False
+                )
+
+                ai_audio = gr.Audio(
+                    label="Audio Response",
+                    autoplay=True,
+                    visible=False
+                )
+
+        def update_status(message, show_response=False):
+            """Update status message and response visibility."""
+            status_html = f'<div class="status-text">{message}</div>'
+            return status_html, gr.update(visible=show_response)
+
+        def handle_voice_input(audio_data):
+            """Handle voice input from audio file."""
+            try:
+                if audio_data is None:
+                    return update_status("Please record your voice first.", False) + ("", "", None)
+
+                # Update status to processing
+                yield update_status("Processing your voice...", False) + ("", "", None)
+
+                # Get speech input
+                text = speech_to_text_from_file(audio_data)
+                yield update_status("Getting AI response...", True) + (text, "", None)
+
+                # Get AI response
+                if text and not text.startswith("Sorry") and not text.startswith("Error"):
+                    response, audio_path = ask_ai(text)
+                    yield update_status("Ready", True) + (text, response, audio_path)
+                else:
+                    yield update_status("Ready", True) + (text, "", None)
+
+            except Exception as e:
+                logger.error(f"Error in voice input handling: {e}")
+                yield update_status(f"Error: {str(e)}", True) + ("", "", None)
+
+        def show_listening_message():
+            """Show listening message when record button is clicked."""
+            return update_status("Click the microphone button below to record your voice.", False) + ("", "", None)
+
+        def reset_interface():
+            """Reset the interface to initial state."""
+            return update_status("Standard voice", False) + ("", "", None)
+
+        # Event handlers
+        record_button.click(
+            fn=show_listening_message,
+            inputs=[],
+            outputs=[status_text, response_section, recognized_text, ai_response, ai_audio]
+        )
+
+        mic_btn.click(
+            fn=show_listening_message,
+            inputs=[],
+            outputs=[status_text, response_section, recognized_text, ai_response, ai_audio]
+        )
+
+        # Handle audio input when recorded
+        audio_input.change(
+            fn=handle_voice_input,
+            inputs=[audio_input],
+            outputs=[status_text, response_section, recognized_text, ai_response, ai_audio]
+        )
+
+        stop_btn.click(
+            fn=reset_interface,
+            inputs=[],
+            outputs=[status_text, response_section, recognized_text, ai_response, ai_audio]
+        )
+
+    return demo
+
+
+# === MAIN EXECUTION ===
+if __name__ == "__main__":
+    try:
+        demo = create_interface()
+
+        demo.launch(
+            share=True,
+            server_name="127.0.0.1",  # Use localhost for local development
+            server_port=7860,
+            show_error=True,
+            quiet=False,
+            inbrowser=True  # Automatically open browser
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to launch application: {e}")
+        print(f"Error: {e}")
